@@ -9,9 +9,7 @@ import com.ledgerline.repo.AccountRepository;
 import com.ledgerline.repo.IdempotencyRecordRepository;
 import com.ledgerline.repo.JournalEntryRepository;
 import com.ledgerline.repo.JournalLineRepository;
-import com.ledgerline.support.Retry;
 import org.springframework.dao.DataIntegrityViolationException;
-import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -21,13 +19,10 @@ import java.util.List;
 
 /**
  * Entry point for ledger operations. Handles account creation, balance and
- * history reads, and the idempotency and retry wrapper around posting.
+ * history reads, and the idempotency short-circuit around posting.
  */
 @Service
 public class LedgerService {
-
-    private static final int MAX_POST_ATTEMPTS = 3;
-    private static final long POST_BACKOFF_MILLIS = 20L;
 
     private final AccountRepository accounts;
     private final JournalEntryRepository entries;
@@ -53,9 +48,11 @@ public class LedgerService {
     }
 
     /**
-     * Post a balanced entry. If {@code idempotencyKey} is set and already
-     * known, the original entry is returned and nothing new is written. A key
-     * that loses a concurrent race is resolved by re-reading the winner.
+     * Post a balanced entry. A known idempotency key returns the original entry
+     * and writes nothing. The real guarantee is in the poster: the key row is
+     * inserted in the same transaction as the lines, so a key that loses a
+     * concurrent race fails that insert, and this method re-reads and returns
+     * the winner rather than surfacing the error.
      */
     public JournalEntry post(PostEntryCommand command, String idempotencyKey) {
         String key = normalize(idempotencyKey);
@@ -67,11 +64,7 @@ public class LedgerService {
         }
 
         try {
-            return Retry.withBackoff(
-                    MAX_POST_ATTEMPTS,
-                    POST_BACKOFF_MILLIS,
-                    e -> e instanceof ObjectOptimisticLockingFailureException,
-                    () -> poster.post(command, key));
+            return poster.post(command, key);
         } catch (DataIntegrityViolationException race) {
             if (key != null) {
                 JournalEntry winner = findByIdempotencyKey(key);

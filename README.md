@@ -34,15 +34,20 @@ currency). Arithmetic across currencies throws rather than silently coercing.
 ## Idempotency
 
 `POST /journal-entries` accepts an optional `Idempotency-Key` header. The key is
-stored in its own table, keyed by the header value, alongside the id of the
-entry it created.
+stored in its own table (`idempotency_key`), keyed by the header value, with the
+id of the entry it created.
 
-- First time a key is seen: the entry is posted and the key is recorded.
-- Repeat of a known key: the original entry is returned and nothing new is
+The key row is inserted in the same transaction that writes the journal lines,
+and `idem_key` is the primary key, so the guarantee is at the database:
+
+- First time a key is seen: the entry is posted and the key row is inserted in
+  one atomic transaction. If either fails, both roll back.
+- Repeat of a known key: a fast lookup returns the original entry and nothing is
   written.
-- Two requests racing with the same key: the key is a primary key, so the
-  second insert fails at the database, and that request re-reads and returns the
-  winner's entry.
+- Two requests racing with the same key: they serialize on the shared account
+  locks (see below), then the second one's key insert violates the primary key.
+  That whole transaction rolls back, including its lines and account version
+  bumps, and the request re-reads and returns the winner's entry.
 
 A request with no key always posts.
 
@@ -53,13 +58,18 @@ lock on that account (`@Lock(PESSIMISTIC_WRITE)` in `AccountRepository`).
 Accounts are locked in ascending id order, so two entries touching the same pair
 of accounts cannot deadlock by locking them in opposite orders.
 
-`Account` also carries an `@Version` column. Each post bumps a counter on every
-account it touches, which forces the version to advance, so the optimistic check
-guards the same path. In practice the pessimistic lock serializes concurrent
-posts to the same account before the optimistic check can fail; the version is a
-second layer, and the retry-with-backoff around the post
-(`support/Retry.java`) exists to absorb an optimistic failure on a fresh
-transaction if one ever does occur.
+Each post runs in a single transaction with no retry. Concurrent posts that
+touch the same account block on that `FOR UPDATE` lock and run one after
+another, so each reads a fresh account row and there is no optimistic conflict
+to recover from. `Account` also carries an `@Version` column, bumped on every
+account a post touches, as a correctness backstop: if some future code path ever
+mutated an account without taking the lock, the version check would reject the
+lost update rather than let it through.
+
+An earlier version wrapped the post in retry-with-backoff on optimistic
+failure. That was wrong: the posting operation is not safe to replay, so a
+retry could post the entry more than once. The fix was to drop the retry and
+rely on the pessimistic lock plus a single transaction.
 
 `ConcurrentPostingIT` posts conflicting entries from several threads at once and
 asserts that every post applies with no lost update, that the entry count is
@@ -136,10 +146,10 @@ Two tiers:
   - `JournalEntryBalanceTest`: the sum-to-zero invariant, direct against the
     domain factory. Balanced constructs; unbalanced, single-line, mixed-currency,
     and account-currency-mismatch all throw.
-  - `RetryTest`: the backoff helper (succeeds first try, retries then succeeds,
-    gives up after max attempts, does not retry a non-retryable failure).
-  - `LedgerServiceIdempotencyTest`: the idempotency decision with Mockito. Same
-    key twice posts once and returns the original.
+  - `LedgerServiceIdempotencyTest`: the service-level idempotency handling with
+    Mockito. A known key short-circuits before the poster runs; a key that loses
+    the race in the poster (a duplicate-key failure) is resolved by re-reading
+    the winner rather than propagated.
   - `LedgerApiTest`: `@SpringBootTest` with a random port over an in-memory
     database. Posts a balanced entry and reads it back, checks balance and
     running balance, rejects an unbalanced entry with `422`, and checks that a
