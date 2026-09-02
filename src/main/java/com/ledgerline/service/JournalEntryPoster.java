@@ -1,7 +1,6 @@
 package com.ledgerline.service;
 
 import com.ledgerline.domain.Account;
-import com.ledgerline.domain.IdempotencyRecord;
 import com.ledgerline.domain.JournalEntry;
 import com.ledgerline.domain.Money;
 import com.ledgerline.domain.PostingLine;
@@ -11,16 +10,18 @@ import com.ledgerline.repo.JournalEntryRepository;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Owns the transaction that writes one entry. Kept as its own bean so
- * {@link LedgerService} can retry it: a retry has to start a fresh
- * transaction, which a self-invocation could not do.
+ * Writes one entry in a single transaction. Concurrent posts that touch the
+ * same account serialize on its {@code SELECT ... FOR UPDATE} row lock, so each
+ * one reads a fresh account version and there is no optimistic conflict to
+ * retry. If an idempotency key is given, its row is inserted in this same
+ * transaction: a duplicate key fails the insert, this transaction rolls back,
+ * and {@link LedgerService} returns the winner's entry.
  */
 @Component
 public class JournalEntryPoster {
@@ -49,11 +50,10 @@ public class JournalEntryPoster {
 
         JournalEntry entry = JournalEntry.create(command.description(), postings);
         locked.values().forEach(Account::recordPosting);
-        JournalEntry saved = entries.save(entry);
+        JournalEntry saved = entries.saveAndFlush(entry);
 
         if (idempotencyKey != null && !idempotencyKey.isBlank()) {
-            idempotencyRecords.save(
-                    new IdempotencyRecord(idempotencyKey.strip(), saved.getId(), Instant.now()));
+            idempotencyRecords.insertRecord(idempotencyKey.strip(), saved.getId());
         }
         return saved;
     }

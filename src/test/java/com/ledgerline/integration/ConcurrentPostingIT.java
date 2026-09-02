@@ -6,11 +6,13 @@ import com.ledgerline.repo.AccountRepository;
 import com.ledgerline.repo.JournalEntryRepository;
 import com.ledgerline.service.LedgerService;
 import com.ledgerline.service.PostEntryCommand;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -33,8 +35,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * without Docker and the pure unit tests still cover the invariants.
  *
  * <p>Locking under test: {@code AccountRepository.findByIdForUpdate} takes a
- * {@code SELECT ... FOR UPDATE} row lock, and {@code Account.version} adds an
- * optimistic guard on the same path.
+ * {@code SELECT ... FOR UPDATE} row lock that serializes concurrent posts to
+ * the same account in a single transaction each, with no retry. Idempotency is
+ * enforced by inserting the key row in that same transaction.
  */
 @SpringBootTest
 @Tag("integration")
@@ -53,6 +56,14 @@ class ConcurrentPostingIT {
 
     @Autowired
     private JournalEntryRepository entries;
+
+    @Autowired
+    private JdbcTemplate jdbc;
+
+    @BeforeEach
+    void startFromEmptyTables() {
+        jdbc.execute("truncate table idempotency_key, journal_line, journal_entry, account restart identity cascade");
+    }
 
     @Test
     void twoConcurrentPostsToTheSameAccountsBothApplyWithNoLostUpdate() throws Exception {
